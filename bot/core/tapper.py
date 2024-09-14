@@ -1,23 +1,26 @@
-import asyncio
-import random
-from urllib.parse import unquote, quote
-
 import aiohttp
+import asyncio
+import functools
+import json
+import os
+import random
+from time import time
+from urllib.parse import unquote, quote
 from aiocfscrape import CloudflareScraper
 from aiohttp_proxy import ProxyConnector
 from better_proxy import Proxy
-from pyrogram import Client
-from pyrogram.errors import Unauthorized, UserDeactivated, AuthKeyUnregistered, FloodWait
-from pyrogram.raw.functions.messages import RequestAppWebView
-from pyrogram.raw.types import InputBotAppShortName
+
+from telethon import TelegramClient
+from telethon.errors import *
+from telethon.types import InputUser, InputBotAppShortName, InputPeerUser
+from telethon.functions import messages, contacts, channels
+
 from .agents import generate_random_user_agent
 from bot.config import settings
 from typing import Callable
-from time import time
-import functools
-from bot.utils import logger
+from bot.utils import logger, proxy_utils, config_utils
 from bot.exceptions import InvalidSession
-from .headers import headers
+from .headers import headers, get_sec_ch_ua
 
 
 def speed_calc(referrals_count, time_since_last_boost):
@@ -45,10 +48,11 @@ def speed_calc(referrals_count, time_since_last_boost):
         speed = 25
     elif referrals_count >= 1:
         speed = 10
-    
+
     t = round(1583 + 1583 * speed / 100)
-    
+
     return t * 2 if is_boost else t
+
 
 def error_handler(func: Callable):
     @functools.wraps(func)
@@ -58,55 +62,70 @@ def error_handler(func: Callable):
         except Exception as e:
             await asyncio.sleep(1)
             logger.error(f"{args[0].session_name} | {func.__name__} error: {e}")
+
     return wrapper
 
-class Tapper:
-    def __init__(self, tg_client: Client, proxy: str):
-        self.tg_client = tg_client
-        self.session_name = tg_client.name
-        self.proxy = proxy
-        self.init_data = None
 
-    async def get_tg_web_data(self) -> str:
-        
+class Tapper:
+    def __init__(self, tg_client: TelegramClient):
+        self.tg_client = tg_client
+        self.session_name, _ = os.path.splitext(os.path.basename(tg_client.session.filename))
+        self.config = config_utils.get_session_config(self.session_name)
+        self.proxy = self.config.get('proxy', None)
+        self.init_data = None
+        self.headers = headers
+        self.headers['User-Agent'] = self.check_user_agent()
+        self.headers.update(**get_sec_ch_ua(self.headers.get('User-Agent', '')))
+
+    def check_user_agent(self):
+        user_agent = self.config.get('user_agent')
+        if not user_agent:
+            user_agent = generate_random_user_agent()
+            self.config['user_agent'] = user_agent
+            config_utils.update_config_file(self.session_name, self.config)
+
+        return user_agent
+
+    async def get_tg_web_data(self) -> str | None:
+
         if self.proxy:
             proxy = Proxy.from_str(self.proxy)
-            proxy_dict = dict(
-                scheme=proxy.protocol,
-                hostname=proxy.host,
-                port=proxy.port,
-                username=proxy.login,
-                password=proxy.password
-            )
+            proxy_dict = proxy_utils.to_telethon_proxy(proxy)
         else:
             proxy_dict = None
 
-        self.tg_client.proxy = proxy_dict
-
+        self.tg_client.set_proxy(proxy_dict)
         try:
-            if not self.tg_client.is_connected:
+            if not self.tg_client.is_connected():
                 try:
-                    await self.tg_client.connect()
-
-                except (Unauthorized, UserDeactivated, AuthKeyUnregistered):
+                    await self.tg_client.start()
+                except (UnauthorizedError, AuthKeyUnregisteredError):
                     raise InvalidSession(self.session_name)
-            
+                except (UserDeactivatedError, UserDeactivatedBanError, PhoneNumberBannedError):
+                    raise InvalidSession(f"{self.session_name}: User is banned")
+
             while True:
                 try:
-                    peer = await self.tg_client.resolve_peer('HorizonLaunch_bot')
+                    resolve_result = await self.tg_client(contacts.ResolveUsernameRequest(username='HorizonLaunch_bot'))
+                    peer = InputPeerUser(user_id=resolve_result.peer.user_id,
+                                         access_hash=resolve_result.users[0].access_hash)
                     break
-                except FloodWait as fl:
-                    fls = fl.value
+                except FloodWaitError as fl:
+                    fls = fl.seconds
 
                     logger.warning(f"{self.session_name} | FloodWait {fl}")
                     logger.info(f"{self.session_name} | Sleep {fls}s")
                     await asyncio.sleep(fls + 3)
-            
-            ref_id = random.choices([settings.REF_ID, "339631649"], weights=[75, 25], k=1)[0]
-            web_view = await self.tg_client.invoke(RequestAppWebView(
+
+            ref_id = settings.REF_ID if random.randint(0, 100) <= 80 else "525256526"
+
+            input_user = InputUser(user_id=resolve_result.peer.user_id, access_hash=resolve_result.users[0].access_hash)
+            input_bot_app = InputBotAppShortName(bot_id=input_user, short_name="HorizonLaunch")
+
+            web_view = await self.tg_client(messages.RequestAppWebViewRequest(
                 peer=peer,
+                app=input_bot_app,
                 platform='android',
-                app=InputBotAppShortName(bot_id=peer, short_name="HorizonLaunch"),
                 write_allowed=True,
                 start_param=ref_id
             ))
@@ -115,7 +134,7 @@ class Tapper:
             tg_web_data = unquote(
                 string=unquote(string=auth_url.split('tgWebAppData=')[1].split('&tgWebAppVersion')[0]))
             tg_web_data_parts = tg_web_data.split('&')
-            
+
             user_data = tg_web_data_parts[0].split('=')[1]
             chat_instance = tg_web_data_parts[1].split('=')[1]
             chat_type = tg_web_data_parts[2].split('=')[1]
@@ -128,80 +147,88 @@ class Tapper:
             init_data = (f"user={user_data_encoded}&chat_instance={chat_instance}&chat_type={chat_type}&"
                          f"start_param={start_param}&auth_date={auth_date}&hash={hash_value}")
 
-            if self.tg_client.is_connected:
+            if self.tg_client.is_connected():
                 await self.tg_client.disconnect()
 
             return init_data
 
         except InvalidSession as error:
-            raise error
+            return None
 
         except Exception as error:
             logger.error(f"{self.session_name} | Unknown error: {error}")
-            await asyncio.sleep(delay=3)
+            return None
 
-    
     @error_handler
     async def make_request(self, http_client, method, endpoint=None, url=None, **kwargs):
         full_url = url or f"https://api.eventhorizongame.xyz{endpoint or ''}"
         response = await http_client.request(method, full_url, **kwargs)
         response.raise_for_status()
         return await response.json()
-    
+
     @error_handler
     async def login(self, http_client):
         return await self.make_request(http_client, 'POST', endpoint="/auth", json={'auth': self.init_data})
-    
+
     @error_handler
     async def boost(self, http_client):
         return await self.make_request(http_client, 'POST', endpoint="/tap?boost=true", json={'auth': self.init_data})
-    
+
     @error_handler
     async def tap_red_button(self, http_client):
         return await self.make_request(http_client, 'POST', endpoint="/tap", json={'auth': self.init_data})
-    
-    
+
     @error_handler
     async def tap(self, http_client, tap_count):
-        return await self.make_request(http_client, 'POST', endpoint=f"/taps?count={tap_count}", json={'auth': self.init_data})
-        
-        
-    @error_handler
-    async def check_proxy(self, http_client: aiohttp.ClientSession) -> None:
-        response = await self.make_request(http_client, 'GET', url='https://httpbin.org/ip', timeout=aiohttp.ClientTimeout(5))
-        ip = response.get('origin', 'Site is not available')
-        logger.info(f"{self.session_name} | Proxy IP: <m>{ip}</m>")
-        
-        
-    
+        return await self.make_request(http_client, 'POST', endpoint=f"/taps?count={tap_count}",
+                                       json={'auth': self.init_data})
+
+    async def check_proxy(self, http_client: aiohttp.ClientSession, proxy: str) -> bool:
+        try:
+            response = await http_client.get(url='https://httpbin.org/ip', timeout=aiohttp.ClientTimeout(5))
+            ip = (await response.json()).get('origin')
+            logger.info(f"<light-yellow>{self.session_name}</light-yellow> | Proxy IP: {ip}")
+            return True
+        except Exception as error:
+            logger.error(f"<light-yellow>{self.session_name}</light-yellow> | Proxy: {proxy} | Error: {error}")
+            return False
+
     async def run(self) -> None:
         if settings.USE_RANDOM_DELAY_IN_RUN:
-                random_delay = random.randint(settings.RANDOM_DELAY_IN_RUN[0], settings.RANDOM_DELAY_IN_RUN[1])
-                logger.info(f"{self.session_name} | Bot will start in <m>{random_delay}s</m>")
-                await asyncio.sleep(random_delay)
-        
-        
-        proxy_conn = ProxyConnector().from_url(self.proxy) if self.proxy else None
-        http_client = CloudflareScraper(headers=headers, connector=proxy_conn)
+            random_delay = random.randint(settings.RANDOM_DELAY_IN_RUN[0], settings.RANDOM_DELAY_IN_RUN[1])
+            logger.info(f"{self.session_name} | Bot will start in <m>{random_delay}s</m>")
+            await asyncio.sleep(random_delay)
+
+        proxy_conn = None
         if self.proxy:
-            await self.check_proxy(http_client=http_client)
-        
-        if settings.FAKE_USERAGENT:            
-            http_client.headers['User-Agent'] = generate_random_user_agent(device_type='android', browser_type='chrome')
+            proxy_conn = ProxyConnector().from_url(self.proxy)
+            http_client = CloudflareScraper(headers=self.headers, connector=proxy_conn)
+            p_type = proxy_conn._proxy_type
+            p_host = proxy_conn._proxy_host
+            p_port = proxy_conn._proxy_port
+            if not await self.check_proxy(http_client=http_client, proxy=f"{p_type}://{p_host}:{p_port}"):
+                return
+        else:
+            http_client = CloudflareScraper(headers=self.headers)
 
         self.init_data = await self.get_tg_web_data()
-        
+
+        if not self.init_data:
+            if not http_client.closed:
+                await http_client.close()
+            if proxy_conn and not proxy_conn.closed:
+                proxy_conn.close()
+            return
+
         while True:
             try:
                 if http_client.closed:
-                    if proxy_conn:
-                        if not proxy_conn.closed:
-                            proxy_conn.close()
+                    if proxy_conn and not proxy_conn.closed:
+                        proxy_conn.close()
 
                     proxy_conn = ProxyConnector().from_url(self.proxy) if self.proxy else None
-                    http_client = aiohttp.ClientSession(headers=headers, connector=proxy_conn)
-                    if settings.FAKE_USERAGENT:            
-                        http_client.headers['User-Agent'] = generate_random_user_agent(device_type='android', browser_type='chrome')  
+                    http_client = aiohttp.ClientSession(headers=self.headers, connector=proxy_conn)
+
                 info_data = await self.login(http_client=http_client)
                 if not info_data or not info_data.get('ok'):
                     logger.info(f"{self.session_name} | Login failed")
@@ -212,20 +239,22 @@ class Tapper:
                 rocket = info_data.get('rocket', {})
                 user_info = info_data.get('user', {})
                 logger.info(f"{self.session_name} | 🚀 Logged in successfully")
-                
+
                 tap = await self.tap_red_button(http_client=http_client)
                 if tap.get("ok", False):
                     rocket = tap.get('rocket', {})
                     user_info = tap.get('user', {})
-                
+
                 boost_attempts = int(rocket.get('boost_attempts', 0))
                 current_time = int(time())
                 last_boost_timestamp = rocket.get('last_boost_timestamp', 0)
                 time_since_last_boost = max(0, current_time - last_boost_timestamp)
                 speed = speed_calc(user_info.get('referrals_count', 0), time_since_last_boost)
-                logger.info(f"{self.session_name} | Name: <m>{user_info.get('name')}</m> | Points: <m>{int(rocket.get('distance', 0))}</m> | Speed: <m>{speed}</m>")
+                logger.info(
+                    f"{self.session_name} | Name: <m>{user_info.get('name')}</m> | Points: <m>{int(rocket.get('distance', 0))}</m> | Speed: <m>{speed}</m>")
                 if user_info.get('referrals_count', 0) >= 1:
-                    logger.info(f"{self.session_name} | You have <m>{6-boost_attempts}</m> boosts. Next boost in <m>{round((3600 - time_since_last_boost) / 60, 2) if round((3600 - time_since_last_boost) / 60, 2) > 0 else '~'}</m> minutes")
+                    logger.info(f"{self.session_name} | You have <m>{6 - boost_attempts}</m> boosts. "
+                                f"Next boost in <m>{round((3600 - time_since_last_boost) / 60, 2) if round((3600 - time_since_last_boost) / 60, 2) > 0 else '~'}</m> minutes")
                     if time_since_last_boost >= 3600 and boost_attempts < 6:
                         boost = await self.boost(http_client=http_client)
                         if boost:
@@ -245,7 +274,8 @@ class Tapper:
                                     taps = await self.tap(http_client=http_client, tap_count=tap_count)
                                     if taps:
                                         rocket = taps.get('rocket', {})
-                                        logger.info(f"{self.session_name} | Tapped <m>{all_tap_count} / 1000</m> | Distance: <m>{int(rocket.get('distance', 0))}</m>")
+                                        logger.info(f"{self.session_name} | Tapped <m>{all_tap_count} / 1000</m> | "
+                                                    f"Distance: <m>{int(rocket.get('distance', 0))}</m>")
                                         sleep_time = random.randint(1, 3)
                                         await asyncio.sleep(sleep_time)
 
@@ -258,7 +288,7 @@ class Tapper:
                     sleep_time = 3600
 
                 logger.info(f"{self.session_name} | Sleep <m>{sleep_time}s</m>")
-                
+
                 await http_client.close()
                 if proxy_conn:
                     if not proxy_conn.closed:
@@ -272,13 +302,11 @@ class Tapper:
                 await asyncio.sleep(delay=3)
                 logger.info(f'{self.session_name} | Sleep <m>600s</m>')
                 await asyncio.sleep(600)
-            
-            
-            
-            
 
-async def run_tapper(tg_client: Client, proxy: str | None):
+
+async def run_tapper(tg_client: TelegramClient):
     try:
-        await Tapper(tg_client=tg_client, proxy=proxy).run()
+        await Tapper(tg_client=tg_client).run()
     except InvalidSession:
-        logger.error(f"{tg_client.name} | Invalid Session")
+        session_name, _ = os.path.splitext(os.path.basename(tg_client.session.filename))
+        logger.error(f"{session_name} | Invalid Session")
