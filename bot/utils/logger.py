@@ -21,7 +21,7 @@ if settings.DEBUG_LOGGING:
 logger = logger.opt(colors=True)
 
 
-def error(text):
+def log_error(text):
     if settings.DEBUG_LOGGING:
         logger.opt(exception=True, colors=True).trace(text)
     return logger.error(text)

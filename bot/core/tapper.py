@@ -1,7 +1,6 @@
 import aiohttp
 import asyncio
 import functools
-import json
 import os
 import random
 from time import time
@@ -13,12 +12,12 @@ from better_proxy import Proxy
 from telethon import TelegramClient
 from telethon.errors import *
 from telethon.types import InputUser, InputBotAppShortName, InputPeerUser
-from telethon.functions import messages, contacts, channels
+from telethon.functions import messages, contacts
 
 from .agents import generate_random_user_agent
 from bot.config import settings
 from typing import Callable
-from bot.utils import logger, proxy_utils, config_utils
+from bot.utils import logger, log_error, proxy_utils, config_utils, CONFIG_PATH
 from bot.exceptions import InvalidSession
 from .headers import headers, get_sec_ch_ua
 
@@ -70,19 +69,22 @@ class Tapper:
     def __init__(self, tg_client: TelegramClient):
         self.tg_client = tg_client
         self.session_name, _ = os.path.splitext(os.path.basename(tg_client.session.filename))
-        self.config = config_utils.get_session_config(self.session_name)
+        self.config = config_utils.get_session_config(self.session_name, CONFIG_PATH)
         self.proxy = self.config.get('proxy', None)
         self.init_data = None
         self.headers = headers
         self.headers['User-Agent'] = self.check_user_agent()
         self.headers.update(**get_sec_ch_ua(self.headers.get('User-Agent', '')))
 
+    def log_message(self, message) -> str:
+        return f"<light-yellow>{self.session_name}</light-yellow> | {message}"
+
     def check_user_agent(self):
         user_agent = self.config.get('user_agent')
         if not user_agent:
             user_agent = generate_random_user_agent()
             self.config['user_agent'] = user_agent
-            config_utils.update_config_file(self.session_name, self.config)
+            config_utils.update_config_file(self.session_name, self.config, CONFIG_PATH)
 
         return user_agent
 
@@ -113,8 +115,8 @@ class Tapper:
                 except FloodWaitError as fl:
                     fls = fl.seconds
 
-                    logger.warning(f"{self.session_name} | FloodWait {fl}")
-                    logger.info(f"{self.session_name} | Sleep {fls}s")
+                    logger.warning(self.log_message(f"FloodWait {fl}"))
+                    logger.info(self.log_message(f"Sleep {fls}s"))
                     await asyncio.sleep(fls + 3)
 
             ref_id = settings.REF_ID if random.randint(0, 100) <= 80 else "525256526"
@@ -156,7 +158,7 @@ class Tapper:
             return None
 
         except Exception as error:
-            logger.error(f"{self.session_name} | Unknown error: {error}")
+            log_error(self.log_message(f"Unknown error: {error}"))
             return None
 
     @error_handler
@@ -187,16 +189,16 @@ class Tapper:
         try:
             response = await http_client.get(url='https://httpbin.org/ip', timeout=aiohttp.ClientTimeout(5))
             ip = (await response.json()).get('origin')
-            logger.info(f"<light-yellow>{self.session_name}</light-yellow> | Proxy IP: {ip}")
+            logger.info(self.log_message(f"Proxy IP: {ip}"))
             return True
         except Exception as error:
-            logger.error(f"<light-yellow>{self.session_name}</light-yellow> | Proxy: {proxy} | Error: {error}")
+            log_error(self.log_message(f"Proxy: {proxy} | Error: {error}"))
             return False
 
     async def run(self) -> None:
         if settings.USE_RANDOM_DELAY_IN_RUN:
             random_delay = random.randint(settings.RANDOM_DELAY_IN_RUN[0], settings.RANDOM_DELAY_IN_RUN[1])
-            logger.info(f"{self.session_name} | Bot will start in <m>{random_delay}s</m>")
+            logger.info(self.log_message(f"Bot will start in <m>{random_delay}s</m>"))
             await asyncio.sleep(random_delay)
 
         proxy_conn = None
@@ -231,14 +233,14 @@ class Tapper:
 
                 info_data = await self.login(http_client=http_client)
                 if not info_data or not info_data.get('ok'):
-                    logger.info(f"{self.session_name} | Login failed")
+                    logger.info(self.log_message(f"Login failed"))
                     await asyncio.sleep(delay=1800)
                     continue
                 await asyncio.sleep(2)
 
                 rocket = info_data.get('rocket', {})
                 user_info = info_data.get('user', {})
-                logger.info(f"{self.session_name} | 🚀 Logged in successfully")
+                logger.info(self.log_message("🚀 Logged in successfully"))
 
                 tap = await self.tap_red_button(http_client=http_client)
                 if tap.get("ok", False):
@@ -250,18 +252,18 @@ class Tapper:
                 last_boost_timestamp = rocket.get('last_boost_timestamp', 0)
                 time_since_last_boost = max(0, current_time - last_boost_timestamp)
                 speed = speed_calc(user_info.get('referrals_count', 0), time_since_last_boost)
-                logger.info(
-                    f"{self.session_name} | Name: <m>{user_info.get('name')}</m> | Points: <m>{int(rocket.get('distance', 0))}</m> | Speed: <m>{speed}</m>")
+                logger.info(self.log_message(
+                    f"Name: <m>{user_info.get('name')}</m> | Points: <m>{int(rocket.get('distance', 0))}</m> | Speed: <m>{speed}</m>"))
                 if user_info.get('referrals_count', 0) >= 1:
-                    logger.info(f"{self.session_name} | You have <m>{6 - boost_attempts}</m> boosts. "
-                                f"Next boost in <m>{round((3600 - time_since_last_boost) / 60, 2) if round((3600 - time_since_last_boost) / 60, 2) > 0 else '~'}</m> minutes")
+                    logger.info(self.log_message(f"You have <m>{6 - boost_attempts}</m> boosts. "
+                                f"Next boost in <m>{round((3600 - time_since_last_boost) / 60, 2) if round((3600 - time_since_last_boost) / 60, 2) > 0 else '~'}</m> minutes"))
                     if time_since_last_boost >= 3600 and boost_attempts < 6:
                         boost = await self.boost(http_client=http_client)
                         if boost:
                             rocket = boost.get('rocket', {})
                             last_boost_timestamp = rocket.get('last_boost_timestamp', current_time)
                             time_since_last_boost = 0
-                            logger.info(f"{self.session_name} | <m>Boosted successfully</m>")
+                            logger.info(self.log_message(f"<m>Boosted successfully</m>"))
                             await asyncio.sleep(3)
 
                             if time_since_last_boost < 3600:
@@ -274,8 +276,8 @@ class Tapper:
                                     taps = await self.tap(http_client=http_client, tap_count=tap_count)
                                     if taps:
                                         rocket = taps.get('rocket', {})
-                                        logger.info(f"{self.session_name} | Tapped <m>{all_tap_count} / 1000</m> | "
-                                                    f"Distance: <m>{int(rocket.get('distance', 0))}</m>")
+                                        logger.info(self.log_message(f"Tapped <m>{all_tap_count} / 1000</m> | "
+                                                    f"Distance: <m>{int(rocket.get('distance', 0))}</m>"))
                                         sleep_time = random.randint(1, 3)
                                         await asyncio.sleep(sleep_time)
 
@@ -287,7 +289,7 @@ class Tapper:
                 else:
                     sleep_time = 3600
 
-                logger.info(f"{self.session_name} | Sleep <m>{sleep_time}s</m>")
+                logger.info(self.log_message(f"Sleep <m>{sleep_time}s</m>"))
 
                 await http_client.close()
                 if proxy_conn:
@@ -298,9 +300,9 @@ class Tapper:
                 raise error
 
             except Exception as error:
-                logger.error(f"{self.session_name} | Unknown error: {error}")
+                log_error(self.log_message(f"Unknown error: {error}"))
                 await asyncio.sleep(delay=3)
-                logger.info(f'{self.session_name} | Sleep <m>600s</m>')
+                logger.info(self.log_message(f'Sleep <m>600s</m>'))
                 await asyncio.sleep(600)
 
 
@@ -309,4 +311,4 @@ async def run_tapper(tg_client: TelegramClient):
         await Tapper(tg_client=tg_client).run()
     except InvalidSession:
         session_name, _ = os.path.splitext(os.path.basename(tg_client.session.filename))
-        logger.error(f"{session_name} | Invalid Session")
+        logger.error(f"<light-yellow>{session_name}</light-yellow> | Invalid Session")

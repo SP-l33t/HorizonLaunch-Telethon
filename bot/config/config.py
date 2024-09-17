@@ -6,6 +6,7 @@ class Settings(BaseSettings):
 
     API_ID: int
     API_HASH: str
+    GLOBAL_CONFIG_PATH: str = "TG_FARM"
    
     REF_ID: str = "525256526"
     USE_RANDOM_DELAY_IN_RUN: bool = True
