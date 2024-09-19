@@ -1,4 +1,5 @@
 import sys
+from os import path
 from loguru import logger
 from bot.config.config import settings
 from datetime import date
@@ -11,7 +12,7 @@ logger.add(sink=sys.stdout, format="<white>{time:YYYY-MM-DD HH:mm:ss}</white>"
            filter=lambda record: record["level"].name != "TRACE")
 
 if settings.DEBUG_LOGGING:
-    logger.add(f"logs/err_tracebacks_{date.today()}.txt",
+    logger.add(path.join('logs', f"err_tracebacks_{date.today()}.txt"),
                format="{time:DD.MM.YYYY HH:mm:ss} - {level} - {message}",
                level="TRACE",
                backtrace=True,
