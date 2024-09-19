@@ -197,7 +197,7 @@ class Tapper:
             logger.info(self.log_message(f"Proxy IP: {ip}"))
             return True
         except Exception as error:
-            log_error(self.log_message(f"Proxy: {proxy} | Error: {error}"))
+            log_error(self.log_message(f"Proxy: {proxy} | Error: {type(error).__name__}. Skipping session."))
             return False
 
     async def run(self) -> None:
@@ -213,8 +213,14 @@ class Tapper:
             p_type = proxy_conn._proxy_type
             p_host = proxy_conn._proxy_host
             p_port = proxy_conn._proxy_port
+
             if not await self.check_proxy(http_client=http_client, proxy=f"{p_type}://{p_host}:{p_port}"):
+                if not http_client.closed:
+                    await http_client.close()
+                if proxy_conn and not proxy_conn.closed:
+                    proxy_conn.close()
                 return
+
         else:
             http_client = CloudflareScraper(headers=self.headers)
 
