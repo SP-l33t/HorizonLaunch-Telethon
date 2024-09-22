@@ -10,7 +10,6 @@ API_HASH = settings.API_HASH
 
 
 async def register_sessions() -> None:
-    print(CONFIG_PATH)
     if not API_ID or not API_HASH:
         raise ValueError("API_ID and API_HASH not found in the .env file.")
 
@@ -47,14 +46,15 @@ async def register_sessions() -> None:
         proxies = proxy_utils.get_unused_proxies(accounts_config, PROXIES_PATH)
         if not proxies:
             raise Exception('No unused proxies left')
+        proxy_str = None
         for prox in proxies:
             if await proxy_utils.check_proxy(prox):
                 proxy_str = prox
                 proxy = proxy_utils.to_telethon_proxy(Proxy.from_str(proxy_str))
                 accounts_data['proxy'] = proxy_str
                 break
-            else:
-                raise Exception('No unused proxies left')
+        if not proxy_str:
+            raise Exception('No unused proxies left')
     else:
         accounts_data['proxy'] = None
 
@@ -67,7 +67,9 @@ async def register_sessions() -> None:
         system_lang_code="en-US",
         **device_params
     )
+    logger.info(f"Using proxy: {proxy}")
     session.set_proxy(proxy)
+
     await session.start()
 
     user_data = await session.get_me()
